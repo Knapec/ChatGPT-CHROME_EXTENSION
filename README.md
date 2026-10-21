@@ -21,7 +21,7 @@
 >
 > Conversation filenames come from their original titles. Duplicate titles receive ` (2)`, ` (3)`, etc., and invalid Windows filename characters are replaced. An incomplete export reports an error instead of silently exporting a partial project.
 >
-> **Use this fork's version:** [Download the latest release](https://github.com/Knapec/ChatGPT-CHROME_EXTENSION/releases/latest) (Chrome ZIP), extract it, then in Chrome open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select the extracted folder containing `manifest.json`. The Chrome Web Store link below points to the **original extension**, not this fork.
+> **Use this fork's version:** Once the [first release](https://github.com/Knapec/ChatGPT-CHROME_EXTENSION/releases) is published, download its Chrome ZIP, extract it, then in Chrome open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select the extracted folder containing `manifest.json`. The Chrome Web Store link below points to the **original extension**, not this fork.
 >
 > Open any conversation within a ChatGPT project and select **Current Project → Markdown → Download**. All other export actions and formats remain available.
 >
