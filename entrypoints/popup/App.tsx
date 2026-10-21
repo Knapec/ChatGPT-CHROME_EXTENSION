@@ -427,7 +427,9 @@ export default function App() {
       return;
     }
     if (response.cancelled) {
-      updateProgress(`Stopped and downloaded ${response.conversations?.length || response.rawConversations?.length || 0} chats${response.failures?.length ? `, skipped ${response.failures.length}` : ''}`, 'cancelled');
+      updateProgress(response.message === 'backUpCurrentProject stopped'
+        ? 'Project backup stopped; no download created'
+        : `Stopped and downloaded ${response.conversations?.length || response.rawConversations?.length || 0} chats${response.failures?.length ? `, skipped ${response.failures.length}` : ''}`, 'cancelled');
       resetRunningStates();
       return;
     }
@@ -481,7 +483,7 @@ export default function App() {
   }
 
   async function stopBackup() {
-    updateProgress('Stopping backup and preparing partial download...', 'cancelled');
+    updateProgress(projectRunning && downloadFormat === 'Markdown' ? 'Stopping project backup...' : 'Stopping backup and preparing partial download...', 'cancelled');
     const response = await sendMessage<StopBackupResponse>({ message: 'stopBackup' });
     if (!response?.stopping) {
       updateProgress('No backup is currently running', 'idle');
