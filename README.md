@@ -6,6 +6,28 @@
 > </a>
 # ChatGPT Backup Tool for Chrome
 
+
+> [!IMPORTANT]
+> **Community fork — fixed Current Project → Markdown export**
+>
+> This fork fixes a bug in which **Current Project** could export only the opened conversation. It now fetches **all chats in the selected ChatGPT project**, including paginated results, and downloads a single ZIP:
+>
+> ```text
+> Project Name.zip
+> └── Project Name/
+>     ├── First Chat.md
+>     └── Second Chat.md
+> ```
+>
+> Conversation filenames come from their original titles. Duplicate titles receive ` (2)`, ` (3)`, etc., and invalid Windows filename characters are replaced. An incomplete export reports an error instead of silently exporting a partial project.
+>
+> **Use this fork's version:** [Download the latest release](https://github.com/Knapec/ChatGPT-CHROME_EXTENSION/releases/latest) (Chrome ZIP), extract it, then in Chrome open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select the extracted folder containing `manifest.json`. The Chrome Web Store link below points to the **original extension**, not this fork.
+>
+> Open any conversation within a ChatGPT project and select **Current Project → Markdown → Download**. All other export actions and formats remain available.
+>
+> **Original project:** [FredySandoval/ChatGPT-CHROME_EXTENSION](https://github.com/FredySandoval/ChatGPT-CHROME_EXTENSION) · **Fix:** [PR #1](https://github.com/Knapec/ChatGPT-CHROME_EXTENSION/pull/1). This is an unofficial extension that relies on ChatGPT internal APIs, which may change.
+
+
 <p align="center">
   <img width="1400" height="560" alt="Marquee promo 1400x560 Canvas" src="https://github.com/user-attachments/assets/6240bf0d-39af-4a2b-a349-9f38e76df969" />
 </p>
