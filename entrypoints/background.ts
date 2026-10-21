@@ -113,6 +113,14 @@ type ProjectInfo = {
   isProjectChat: boolean;
 };
 
+type ProjectPage<T> = {
+  items: T[];
+  cursor?: string | null;
+  next_cursor?: string | null;
+  has_more?: boolean;
+  hasMore?: boolean;
+};
+
 type DownloadTimingSettings = { secondsBetweenChatDownloads?: number };
 type BackupAllRequest = { message: 'backUpAllAsJSON' | 'backUpAllAsRAWJSON'; startOffset: number; stopOffset: number } & DownloadTimingSettings;
 type BackupAllMarkdownRequest = { message: 'backUpAllAsMARKDOWN'; startOffset: number; stopOffset: number } & MarkdownSettings & DownloadTimingSettings;
@@ -169,16 +177,21 @@ function sanitizeFilename(name = 'untitled'): string {
     .slice(0, 120) || 'untitled';
 }
 
-function dedupeFilename(baseName: string, seenNames: Set<string>): string {
+function sanitizeProjectFilename(name: string): string {
+  const sanitized = name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').replace(/[. ]+$/g, '') || 'untitled';
+  return /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(sanitized) ? `_${sanitized}` : sanitized;
+}
+
+function dedupeFilename(baseName: string, seenNames: Set<string>, ignoreCase = false): string {
   let candidate = baseName;
   let counter = 2;
 
-  while (seenNames.has(candidate)) {
+  while (seenNames.has(ignoreCase ? candidate.toLowerCase() : candidate)) {
     candidate = `${baseName} (${counter})`;
     counter += 1;
   }
 
-  seenNames.add(candidate);
+  seenNames.add(ignoreCase ? candidate.toLowerCase() : candidate);
   return candidate;
 }
 
@@ -1062,72 +1075,61 @@ chrome.runtime.onMessage.addListener(function (rawRequest: unknown, _sender: chr
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       try {
         const activeTab = tabs[0];
-        const projectInfo = parseProjectInfoFromUrl(activeTab.url || '');
+        if (!activeTab?.url || new URL(activeTab.url).origin !== 'https://chatgpt.com') {
+          throw new Error('Current tab is not a ChatGPT project chat.');
+        }
+        const projectInfo = parseProjectInfoFromUrl(activeTab.url);
         if (!projectInfo.isProjectChat || !projectInfo.normalizedProjectIdFromSlug) {
-          sendResponse({ message: 'backUpCurrentProject failed', error: 'Current tab is not a project chat.' });
-          return;
+          throw new Error('Current tab is not a ChatGPT project chat.');
         }
-
-        const { token, id } = await getConversationIdFromTabs(tabs);
-        const referenceConversation = await fetchConversation(token, id);
-        debugLog(`GPT-BACKUP::PROJECT::reference-conversation::${JSON.stringify({
-          projectInfo,
-          title: referenceConversation?.title,
-          conversation_id: referenceConversation?.conversation_id,
-          identifiers: extractProjectIdentifiers(referenceConversation),
-        })}`);
-
-        if (!activeTab.id || !projectInfo.projectSlug) {
-          sendResponse({ message: 'backUpCurrentProject failed', error: 'Missing active ChatGPT project tab.' });
-          return;
-        }
-
-        const conversationIdsFromDom = await getProjectConversationIdsFromTab(activeTab.id, projectInfo.projectSlug);
-        const orderedConversationIds = Array.from(new Set([id, ...conversationIdsFromDom]));
-        debugLog(`GPT-BACKUP::PROJECT::conversation-ids-from-dom::${JSON.stringify({
-          projectSlug: projectInfo.projectSlug,
-          conversationIdsFromDom,
-          orderedConversationIds,
-        })}`);
 
         activeBackupController = createCancellationController();
+        const token = await loadToken();
+        const projectId = projectInfo.normalizedProjectIdFromSlug;
+        setProgress('Reading project metadata...', 0, 'running');
+        const projectName = await getProjectName(token, projectId, activeBackupController);
+        const orderedConversationIds = await getProjectConversationIds(token, projectId, activeBackupController);
+        if (!orderedConversationIds.length) throw new Error('The selected project has no conversations to export.');
+
         const result = await fetchRawConversationsByIds(token, orderedConversationIds, activeBackupController, getChatDownloadDelayMs(request.secondsBetweenChatDownloads));
-        const filteredRawConversations = filterRawConversationsByProject(result.rawConversations, projectInfo, referenceConversation);
-        const fallbackRawConversations = filteredRawConversations.length ? filteredRawConversations : result.rawConversations;
-        debugLog(`GPT-BACKUP::PROJECT::dom-fetch-result::${JSON.stringify({
-          fetched: result.rawConversations.length,
-          filtered: filteredRawConversations.length,
-          usingFallbackToDomIds: filteredRawConversations.length === 0,
-          failures: result.failures,
-        })}`);
-        const filteredConversations = normalizeRawConversations(fallbackRawConversations);
+        if (request.downloadType === 'markdown') {
+          if (result.cancelled || isCancelled(activeBackupController)) throw new Error('Backup stopped by user');
+          if (result.failures.length) {
+            throw new Error(`Could not fetch ${result.failures.length} project chat(s): ${result.failures[0].error}. No incomplete ZIP was downloaded.`);
+          }
+          if (result.rawConversations.some((chat) => !chat.mapping || typeof chat.mapping !== 'object')) {
+            throw new Error('Invalid project conversation content. No incomplete ZIP was downloaded.');
+          }
+        }
+        const conversations = normalizeRawConversations(result.rawConversations);
         const summary = result.cancelled
-          ? `Stopped and downloaded ${fallbackRawConversations.length} project chats${result.failures.length ? `, skipped ${result.failures.length}` : ''}`
+          ? `Stopped and downloaded ${conversations.length} project chats${result.failures.length ? `, skipped ${result.failures.length}` : ''}`
           : result.failures.length
-            ? `Downloaded ${fallbackRawConversations.length} project chats, skipped ${result.failures.length}`
-            : `Downloaded ${fallbackRawConversations.length} project chats`;
+            ? `Downloaded ${conversations.length} project chats, skipped ${result.failures.length}`
+            : `Downloaded ${conversations.length} project chats`;
 
         if (request.downloadType === 'raw-json') {
-          setProgress('Building project raw JSON file...', fallbackRawConversations.length, result.cancelled ? 'cancelled' : 'running', orderedConversationIds.length);
-          await downloadRawJson(fallbackRawConversations);
-          sendResponse({ message: 'backUpCurrentProject done', rawConversations: fallbackRawConversations, failures: result.failures, cancelled: result.cancelled, projectInfo });
+          setProgress('Building project raw JSON file...', conversations.length, result.cancelled ? 'cancelled' : 'running', orderedConversationIds.length);
+          await downloadRawJson(result.rawConversations);
+          sendResponse({ message: 'backUpCurrentProject done', rawConversations: result.rawConversations, failures: result.failures, cancelled: result.cancelled, projectInfo });
         } else if (request.downloadType === 'json') {
-          setProgress('Building project JSON file...', filteredConversations.length, result.cancelled ? 'cancelled' : 'running', orderedConversationIds.length);
-          await downloadJson(filteredConversations);
-          sendResponse({ message: 'backUpCurrentProject done', conversations: filteredConversations, failures: result.failures, cancelled: result.cancelled, projectInfo });
+          setProgress('Building project JSON file...', conversations.length, result.cancelled ? 'cancelled' : 'running', orderedConversationIds.length);
+          await downloadJson(conversations);
+          sendResponse({ message: 'backUpCurrentProject done', conversations, failures: result.failures, cancelled: result.cancelled, projectInfo });
         } else {
-          setProgress('Building project markdown zip...', filteredConversations.length, result.cancelled ? 'cancelled' : 'running', orderedConversationIds.length);
-          await downloadMarkdownZip(filteredConversations, request.userLabel || 'USER', request.assistantLabel || 'ASSISTANT', request.markdownExtension || '.md', request.mdxFrontmatter || '---\ntitle: "{{title}}"\n---');
-          sendResponse({ message: 'backUpCurrentProject done', conversations: filteredConversations, failures: result.failures, cancelled: result.cancelled, projectInfo });
+          setProgress('Building project markdown zip...', conversations.length, 'running', orderedConversationIds.length);
+          await downloadMarkdownZip(conversations, request.userLabel || 'USER', request.assistantLabel || 'ASSISTANT', '.md', '', false, projectName);
+          sendResponse({ message: 'backUpCurrentProject done', conversations, failures: result.failures, cancelled: false, projectInfo });
         }
 
-        setProgress(summary, fallbackRawConversations.length + result.failures.length, result.cancelled || result.failures.length ? 'warning' : 'done', orderedConversationIds.length);
+        setProgress(summary, conversations.length + result.failures.length, result.cancelled || result.failures.length ? 'warning' : 'done', orderedConversationIds.length);
         activeBackupController = null;
       } catch (error) {
         debugError('GPT-BACKUP::ERROR::PROJECT', error);
+        const wasCancelled = getErrorMessage(error) === 'Backup stopped by user';
         activeBackupController = null;
-        setProgress(`Backup failed: ${getErrorMessage(error)}`, 0, 'error');
-        sendResponse({ message: 'backUpCurrentProject failed', error: getErrorMessage(error) });
+        setProgress(wasCancelled ? 'Project backup stopped; no download created' : `Backup failed: ${getErrorMessage(error)}`, 0, wasCancelled ? 'cancelled' : 'error');
+        sendResponse({ message: wasCancelled ? 'backUpCurrentProject stopped' : 'backUpCurrentProject failed', error: getErrorMessage(error), cancelled: wasCancelled });
       }
     });
   }
@@ -1210,42 +1212,65 @@ async function getConversationIdFromTabs(tabs: chrome.tabs.Tab[]): Promise<{ tok
   return { token, id: conversationId, projectInfo };
 }
 
-async function ensureProjectContentScript(tabId: number) {
-  try {
-    return await new Promise<AnyRecord | undefined>((resolve, reject) => {
-      chrome.tabs.sendMessage(tabId, { message: 'getCurrentProjectConversationIds', projectSlug: '__ping__' }, (response) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
-
-        resolve(response);
-      });
-    });
-  } catch (error) {
-    debugLog(`GPT-BACKUP::PROJECT::content-script-missing::${JSON.stringify({ tabId, error: getErrorMessage(error) })}`);
-    throw new Error('Update required: This ChatGPT tab was opened before the extension update, so project backup cannot reach the page yet. Reload or hard-refresh the ChatGPT tab, then retry the project backup.');
+async function getProjectPage<T>(token: string, path: string, cursor: string | null): Promise<ProjectPage<T>> {
+  const query = cursor === null ? '' : `?cursor=${encodeURIComponent(cursor)}`;
+  const response = await fetch(`https://chatgpt.com/backend-api/gizmos/${path}${query}`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    if (response.status === 401) clearTokenCache();
+    throw new Error(`Could not read project API (${response.status}). Project export was not downloaded.`);
   }
+  const page = await response.json() as ProjectPage<T>;
+  if (!page || !Array.isArray(page.items)) throw new Error('Invalid project API response: missing items.');
+  return page;
 }
 
-async function getProjectConversationIdsFromTab(tabId: number, projectSlug: string): Promise<string[]> {
-  await ensureProjectContentScript(tabId);
+function getNextProjectCursor(page: ProjectPage<unknown>, seenCursors: Set<string>): string | null {
+  const cursor = page.next_cursor ?? page.cursor;
+  const hasMore = page.has_more ?? page.hasMore;
+  if (hasMore === false) return null;
+  if (cursor == null || cursor === '') {
+    if (hasMore) throw new Error('Project API pagination is incomplete: missing next cursor.');
+    return null;
+  }
+  if (typeof cursor !== 'string' || seenCursors.has(cursor)) {
+    throw new Error('Project API pagination is invalid: repeated or malformed cursor.');
+  }
+  seenCursors.add(cursor);
+  return cursor;
+}
 
-  return new Promise<string[]>((resolve, reject) => {
-    chrome.tabs.sendMessage(tabId, { message: 'getCurrentProjectConversationIds', projectSlug }, (response) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-        return;
-      }
+async function getProjectName(token: string, projectId: string, controller: CancellationController): Promise<string> {
+  const seenCursors = new Set<string>();
+  let cursor: string | null = null;
+  do {
+    if (isCancelled(controller)) throw new Error('Backup stopped by user');
+    const page = await getProjectPage<{ gizmo?: { id?: string; display?: { name?: string } } }>(token, 'snorlax/sidebar', cursor);
+    const name = page.items.find((item) => item?.gizmo?.id === projectId)?.gizmo?.display?.name;
+    if (typeof name === 'string' && name.trim()) return name;
+    cursor = getNextProjectCursor(page, seenCursors);
+  } while (cursor !== null);
+  throw new Error('Could not resolve the selected project name from ChatGPT project metadata.');
+}
 
-      if (response?.error) {
-        reject(new Error(response.error));
-        return;
-      }
-
-      resolve(Array.isArray(response?.conversationIds) ? response.conversationIds : []);
-    });
-  });
+async function getProjectConversationIds(token: string, projectId: string, controller: CancellationController): Promise<string[]> {
+  const ids = new Set<string>();
+  // The project endpoint uses cursor pagination, starting at 0, not chat-list offsets.
+  const seenCursors = new Set<string>(['0']);
+  let cursor: string | null = '0';
+  do {
+    if (isCancelled(controller)) throw new Error('Backup stopped by user');
+    setProgress(`Listing project chats... (${ids.size} found)`, 0, 'running');
+    const page = await getProjectPage<{ id: string }>(token, `${encodeURIComponent(projectId)}/conversations`, cursor);
+    for (const item of page.items) {
+      if (typeof item?.id !== 'string' || !item.id.trim()) throw new Error('Invalid project conversation ID in project API response.');
+      ids.add(item.id);
+    }
+    cursor = getNextProjectCursor(page, seenCursors);
+  } while (cursor !== null);
+  if (isCancelled(controller)) throw new Error('Backup stopped by user');
+  return Array.from(ids);
 }
 
 async function fetchRawConversationsByIds(token: string, conversationIds: string[], controller: CancellationController, chatDownloadDelayMs = getChatDownloadDelayMs()) {
@@ -1369,38 +1394,6 @@ function applyMdxFrontmatter(markdown: string, title: string, markdownExtension:
   const frontmatter = String(mdxFrontmatter || '').replaceAll('{{title}}', String(title || 'untitled'));
   const normalizedFrontmatter = frontmatter.trim() ? `${frontmatter.trim()}\n\n` : '';
   return `${normalizedFrontmatter}${markdown}`;
-}
-
-function filterRawConversationsByProject(rawConversations: ChatGptRawConversation[], projectInfo: ProjectInfo, referenceConversation: ChatGptRawConversation | null = null): ChatGptRawConversation[] {
-  const projectCandidates = new Set([
-    projectInfo?.normalizedProjectIdFromSlug,
-    projectInfo?.projectSlug,
-    ...(referenceConversation ? extractProjectIdentifiers(referenceConversation) : []),
-  ].filter(Boolean));
-
-  debugLog(`GPT-BACKUP::PROJECT::filter-candidates::${JSON.stringify(Array.from(projectCandidates))}`);
-
-  const filtered = rawConversations.filter((conversation) => {
-    const identifiers = extractProjectIdentifiers(conversation);
-    return identifiers.some((identifier) => projectCandidates.has(identifier));
-  });
-
-  debugLog(`GPT-BACKUP::PROJECT::filter-result::${JSON.stringify({
-    totalRawConversations: rawConversations.length,
-    matched: filtered.length,
-    unmatchedSample: rawConversations.slice(0, 5).map((conversation) => ({
-      title: conversation?.title,
-      conversation_id: conversation?.conversation_id,
-      identifiers: extractProjectIdentifiers(conversation),
-    })),
-    matchedSample: filtered.slice(0, 5).map((conversation) => ({
-      title: conversation?.title,
-      conversation_id: conversation?.conversation_id,
-      identifiers: extractProjectIdentifiers(conversation),
-    })),
-  })}`);
-
-  return filtered;
 }
 
 function normalizeRawConversations(rawConversations: ChatGptRawConversation[]): ParsedConversation[] {
@@ -1533,15 +1526,16 @@ function logUnsupportedAssets(chat: ParsedConversation): void {
   }
 }
 
-async function downloadMarkdownZip(chats: ParsedConversation[], userLabel: string, assistantLabel: string, markdownExtension: MarkdownExtension = '.md', mdxFrontmatter = '---\ntitle: "{{title}}"\n---', includeImages = false) {
+async function downloadMarkdownZip(chats: ParsedConversation[], userLabel: string, assistantLabel: string, markdownExtension: MarkdownExtension = '.md', mdxFrontmatter = '---\ntitle: "{{title}}"\n---', includeImages = false, projectName?: string) {
   const dateStr = new Date().toISOString().replace(/[:.]/g, '-');
+  const projectDirectory = projectName === undefined ? '' : `${sanitizeProjectFilename(projectName)}/`;
   const onlyOneChat = chats.length === 1;
   const enrichedChats = enrichChatsForJson(chats);
   const shouldBundleAssets = includeImages && onlyOneChat && Boolean(
     enrichedChats[0]?.images?.length || enrichedChats[0]?.attachments?.length || enrichedChats[0]?.unsupported_assets?.length,
   );
 
-  if (onlyOneChat && !shouldBundleAssets) {
+  if (onlyOneChat && !shouldBundleAssets && !projectDirectory) {
     const title = sanitizeFilename(enrichedChats[0].title || 'untitled');
     const markdown = applyMdxFrontmatter(
       jsonToMarkdown(enrichedChats[0], userLabel, assistantLabel, includeImages),
@@ -1558,15 +1552,15 @@ async function downloadMarkdownZip(chats: ParsedConversation[], userLabel: strin
 
   try {
     for (const chat of enrichedChats) {
-      const title = sanitizeFilename(chat.title || 'untitled');
-      const filename = dedupeFilename(title, seenNames);
+      const title = projectDirectory ? sanitizeProjectFilename(chat.title || 'untitled') : sanitizeFilename(chat.title || 'untitled');
+      const filename = dedupeFilename(title, seenNames, Boolean(projectDirectory));
       const markdown = applyMdxFrontmatter(
         jsonToMarkdown(chat, userLabel, assistantLabel, shouldBundleAssets),
         chat.title || 'untitled',
         markdownExtension,
         mdxFrontmatter,
       );
-      await zipWriter.add(`${filename}${markdownExtension}`, new TextReader(markdown));
+      await zipWriter.add(`${projectDirectory}${filename}${markdownExtension}`, new TextReader(markdown));
       if (shouldBundleAssets) {
         logUnsupportedAssets(chat);
         await addChatImagesToZip(zipWriter, chat);
@@ -1575,7 +1569,7 @@ async function downloadMarkdownZip(chats: ParsedConversation[], userLabel: strin
     }
 
     const content = await zipWriter.close();
-    return saveAs(content, 'application/zip', `gpt-backup-${dateStr}.zip`);
+    return saveAs(content, 'application/zip', projectDirectory ? `${projectDirectory.slice(0, -1)}.zip` : `gpt-backup-${dateStr}.zip`);
   } catch (error) {
     await zipWriter.close().catch(() => {});
     throw error;
